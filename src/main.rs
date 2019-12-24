@@ -1,25 +1,21 @@
 use anyhow::{bail, Context};
-use std::io::Write;
-use std::path::Path;
+use std::{io::Write, path::Path};
 use structopt::StructOpt;
-use toml_edit::Item;
+use toml_edit::{Document, Item};
 
 fn run() -> Result<(), anyhow::Error> {
-    let Opt::UpdateGitRev { crates } = Opt::from_args();
+    let Opt::UpdateGitRev { crates, all } = Opt::from_args();
 
     let cargo_toml = std::fs::read_to_string("Cargo.toml").context("Can't read Cargo.toml")?;
     let mut parsed = cargo_toml
         .parse::<toml_edit::Document>()
         .context("Can't parse Cargo.toml as toml")?;
 
-    let crates_with_urls = crates
-        .into_iter()
-        .map(|krate| match &parsed["dependencies"][&krate]["git"] {
-            Item::Value(val) if val.is_str() => Ok((krate, val.as_str().unwrap().to_owned())),
-            Item::None => bail!("Crate {} is not a git dependency", krate),
-            _ => bail!("Crate {} git key is not a string", krate),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let crates_with_urls = if all {
+        git_crates(&parsed)
+    } else {
+        depends_with_url(&parsed, crates)
+    }?;
 
     for (krate, url) in crates_with_urls {
         let tmp_dir = tempfile::tempdir().context("Can't create temporary directory")?;
@@ -43,6 +39,37 @@ fn run() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn depends_with_url(
+    doc: &Document,
+    crates: Vec<String>,
+) -> Result<Vec<(String, String)>, anyhow::Error> {
+    crates
+        .into_iter()
+        .map(|krate| match &doc["dependencies"][&krate]["git"] {
+            Item::Value(val) if val.is_str() => Ok((krate, val.as_str().unwrap().to_owned())),
+            Item::None => bail!("Crate {} is not a git dependency", krate),
+            _ => bail!("Crate {} git key is not a string", krate),
+        })
+        .collect()
+}
+
+fn git_crates(doc: &Document) -> Result<Vec<(String, String)>, anyhow::Error> {
+    match &doc["dependencies"] {
+        Item::Table(ref tab) => Ok(tab
+            .iter()
+            .filter_map(|(k, v)| v.as_table_like().map(|v| (k, v)))
+            .filter_map(|(k, v)| {
+                v.get("git")
+                    .and_then(|url| url.as_value())
+                    .and_then(|url| url.as_str())
+                    .map(|v| (k.to_owned(), v.to_owned()))
+            })
+            .collect()),
+        Item::None => Ok(Vec::new()),
+        _ => anyhow::bail!("Invalid Cargo.toml: [dependencies] is not a table"),
+    }
+}
+
 fn write(path: impl AsRef<Path>, cont: &[u8]) -> Result<(), std::io::Error> {
     let path = path.as_ref();
     let parent = path
@@ -63,8 +90,10 @@ fn write(path: impl AsRef<Path>, cont: &[u8]) -> Result<(), std::io::Error> {
 #[derive(StructOpt)]
 enum Opt {
     UpdateGitRev {
-        #[structopt(required = true)]
         crates: Vec<String>,
+
+        #[structopt(short, long)]
+        all: bool,
     },
 }
 
